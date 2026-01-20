@@ -225,9 +225,23 @@ def is_big_vehicle_row(r):
 def selector_big(r):
     return is_big_vehicle_row(r)
 
-def allocate_one_best(plan_pool: pd.DataFrame, selector_fn):
+def allocate_one_best(plan_pool: pd.DataFrame, selector_fn, demand_cluster: str | None = None):
     eligible = plan_pool[(plan_pool["avail"] > 0)].copy()
     eligible = eligible[eligible.apply(selector_fn, axis=1)].copy()
+
+    # Regra: Kangu NÃO pode fazer sinergia entre clusters.
+    # Ou seja: se o veículo for do tipo frota "KANGU", ele só pode ser alocado
+    # para o cluster de demanda original (Cluster == demand_cluster).
+    if demand_cluster is not None and not eligible.empty:
+        kangu_mask = eligible["Tipo Frota"].astype(str).str.upper().str.strip().eq("KANGU")
+        eligible = pd.concat(
+            [
+                eligible[~kangu_mask],
+                eligible[kangu_mask & (eligible["Cluster"].astype(str) == str(demand_cluster))],
+            ],
+            axis=0,
+        )
+
     if eligible.empty:
         return None, plan_pool
 
@@ -293,7 +307,7 @@ def allocate_for_cluster(
         min_medio = required_units_by_capacity(sum_ov_kg, sum_ov_m3, MEDIO_BASE_KG_EFF, MEDIO_BASE_M3_EFF)
 
         for _ in range(min_medio):
-            row, plan_pool = allocate_one_best(plan_pool, selector_class("MEDIO"))
+            row, plan_pool = allocate_one_best(plan_pool, selector_class("MEDIO"), demand_cluster=cluster_name)
             if row is None:
                 all_faltas.append({"Grupo_Sinergia": group_key, "Cluster": cluster_name, "HUB": hub, "Tipo": "MIN_MEDIO", "Faltou": 1})
                 break
@@ -325,7 +339,7 @@ def allocate_for_cluster(
             if hub_demand[hub]["rem_kg"] <= 1e-6 and hub_demand[hub]["rem_m3"] <= 1e-6:
                 break
 
-            row, plan_pool = allocate_one_best(plan_pool, selector_big)
+            row, plan_pool = allocate_one_best(plan_pool, selector_big, demand_cluster=cluster_name)
             if row is None:
                 all_faltas.append({"Grupo_Sinergia": group_key, "Cluster": cluster_name, "HUB": hub, "Tipo": "EXTRA_BIG", "Faltou": 1})
                 break
@@ -351,7 +365,7 @@ def allocate_for_cluster(
         rem_m3 = float(hub_demand[hub]["rem_m3"])
 
         while rem_kg > 1e-6 or rem_m3 > 1e-6:
-            row, plan_pool = allocate_one_best(plan_pool, lambda r: True)
+            row, plan_pool = allocate_one_best(plan_pool, lambda r: True, demand_cluster=cluster_name)
             if row is None:
                 records.append({
                     "Grupo_Sinergia": group_key,
