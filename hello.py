@@ -847,103 +847,175 @@ def to_excel_bytes_multi(sheets: dict) -> bytes:
 
 # STREAMLIT UI
 # =========================
+
 st.set_page_config(page_title="Alocação por Cluster", layout="wide")
 
 st.title("Alocação de Veículos por Cluster (Plano x ISs)")
 
+# -------------------------
+# SESSION STATE
+# -------------------------
+if "result_ready" not in st.session_state:
+    st.session_state.result_ready = False
+    st.session_state.output_consolidado = None
+    st.session_state.saldo_plano = None
+    st.session_state.analyses = None
+    st.session_state.debug_alloc = None
+    st.session_state.plan_common = None
+
+# -------------------------
+# SIDEBAR (inputs + navegação)
+# -------------------------
 with st.sidebar:
-    st.header("Upload dos arquivos")
-    plan_file = st.file_uploader("PlanoRotas (Excel)", type=["xlsx"])
-    is_file = st.file_uploader("ISsDIa (Excel)", type=["xlsx"])
+    st.header("Arquivos")
+
+    plan_file = st.file_uploader("PlanoRotas (Excel)", type=["xlsx"], key="plan_upl")
+    is_file = st.file_uploader("ISsDIa (Excel)", type=["xlsx"], key="is_upl")
 
     st.divider()
-    st.caption("Config atual:")
-    st.write(f"- OCCUPANCY_M3: {OCCUPANCY_M3}")
-    st.write(f"- OCCUPANCY_KG: {OCCUPANCY_KG}")
+    st.header("Regras / Opções")
 
     enable_synergy = st.checkbox(
         "Ativar sinergia: clusters com mesmo prefixo antes do ponto (ex: 'CLUSTER 1.x')",
-        value=True
+        value=True,
+        key="enable_synergy",
     )
 
-run = st.button("Rodar alocação", type="primary", disabled=not (plan_file and is_file))
+    st.caption("Obs.: Kangu NÃO faz sinergia (fica travado no cluster original).")
 
+    st.divider()
+    page = st.radio("Interface", ["Output", "Análises"], index=0, key="page")
+
+    run = st.button("Rodar alocação", type="primary", disabled=not (plan_file and is_file))
+
+# -------------------------
+# PROCESSAMENTO (quando clicar)
+# -------------------------
 if run:
     try:
         with st.spinner("Lendo arquivos e processando..."):
             plan_df = pd.read_excel(plan_file)
             is_df = pd.read_excel(is_file)
-            output_consolidado, saldo_plano, debug_alloc, saldo_debug, plan_common = run_allocation(plan_df, is_df, enable_synergy=enable_synergy, return_debug=True)
+
+            # roda com debug para alimentar análises e rastreios (sinergia, proporcionalidade etc.)
+            output_consolidado, saldo_plano, debug_alloc, saldo_debug, plan_common = run_allocation(
+                plan_df, is_df, enable_synergy=enable_synergy, return_debug=True
+            )
+
+            analyses = build_analyses(
+                output_final=output_consolidado,
+                saldo_final=saldo_plano,
+                debug_alloc=debug_alloc,
+                plan_common=plan_common,
+            )
+
+            st.session_state.output_consolidado = output_consolidado
+            st.session_state.saldo_plano = saldo_plano
+            st.session_state.debug_alloc = debug_alloc
+            st.session_state.plan_common = plan_common
+            st.session_state.analyses = analyses
+            st.session_state.result_ready = True
 
         st.success("Processamento concluído!")
 
-        # =========================
-        # ANÁLISES
-        # =========================
-        analyses = build_analyses(output_consolidado, saldo_plano, debug_alloc, plan_common)
+    except Exception as e:
+        st.session_state.result_ready = False
+        st.error("Erro ao processar. Veja detalhes abaixo:")
+        st.exception(e)
 
-        with st.expander("📊 Análises de distribuição (clique para abrir)", expanded=True):
-            st.subheader("Resumo por Tipo de Frota (Oferta x Usado x Saldo)")
-            st.dataframe(analyses.get("Resumo_Frota"), use_container_width=True, hide_index=True)
+# -------------------------
+# UI (duas interfaces)
+# -------------------------
+if not st.session_state.result_ready:
+    st.info("Faça upload dos 2 arquivos na barra lateral e clique em **Rodar alocação**.")
+else:
+    output_consolidado = st.session_state.output_consolidado
+    saldo_plano = st.session_state.saldo_plano
+    analyses = st.session_state.analyses or {}
 
-            st.subheader("Resumo por Classe de Veículo (VUC/VAN/MEDIO/TRUCK/CARRETA...)")
-            st.dataframe(analyses.get("Resumo_Classe"), use_container_width=True, hide_index=True)
+    if page == "Output":
+        st.subheader("Output consolidado (somente colunas pedidas)")
 
-            cA, cB = st.columns(2)
-            with cA:
-                st.subheader("Uso por Cluster x Tipo Frota")
-                st.dataframe(analyses.get("Uso_Cluster_Frota"), use_container_width=True, hide_index=True)
-            with cB:
-                st.subheader("Uso por HUB x Tipo Frota")
-                st.dataframe(analyses.get("Uso_HUB_Frota"), use_container_width=True, hide_index=True)
+        st.dataframe(output_consolidado, use_container_width=True, hide_index=True)
 
-            st.subheader("Distribuição por Transportadora (Oferta vs Uso vs Saldo + Delta)")
-            st.dataframe(analyses.get("Distribuicao_Transportadora"), use_container_width=True, hide_index=True)
+        col1, col2, col3 = st.columns(3)
 
-            st.subheader("Uso por Cluster x Transportadora")
-            st.dataframe(analyses.get("Uso_Cluster_Transportadora"), use_container_width=True, hide_index=True)
-
-            st.subheader("Sinergia: empréstimos entre clusters (Cluster_Oferta → Cluster demanda)")
-            st.dataframe(analyses.get("Sinergia_Emprestimos"), use_container_width=True, hide_index=True)
-
-            st.subheader("Proporcionalidade por bucket (Grupo_Sinergia + Frota + Classe)")
-            st.dataframe(analyses.get("Proporcionalidade_Bucket"), use_container_width=True, hide_index=True)
-
-
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.subheader("output_consolidado")
-            st.dataframe(output_consolidado, use_container_width=True, hide_index=True)
+        with col1:
             st.download_button(
-                "⬇️ Baixar output_consolidado (CSV)",
+                "⬇️ Baixar Output (CSV)",
                 data=to_csv_bytes(output_consolidado),
                 file_name="output_consolidado.csv",
                 mime="text/csv",
             )
 
-        with c2:
-            st.subheader("saldo_plano")
-            st.dataframe(saldo_plano, use_container_width=True, hide_index=True)
+        with col2:
             st.download_button(
-                "⬇️ Baixar saldo_plano (CSV)",
+                "⬇️ Baixar Saldo (CSV)",
                 data=to_csv_bytes(saldo_plano),
                 file_name="saldo_plano.csv",
                 mime="text/csv",
             )
 
-        st.divider()
-        sheets = {"output_consolidado": output_consolidado, "saldo_plano": saldo_plano, **analyses}
-        excel_bytes = to_excel_bytes_multi(sheets)
-        st.download_button(
-            "⬇️ Baixar Excel completo (2 abas)",
-            data=excel_bytes,
-            file_name="output_alocacao_por_cluster.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        with col3:
+            excel_bytes = to_excel_bytes_multi(
+                {"output_consolidado": output_consolidado, "saldo_plano": saldo_plano}
+            )
+            st.download_button(
+                "⬇️ Baixar Excel (Output + Saldo)",
+                data=excel_bytes,
+                file_name="output_alocacao_por_cluster.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
-    except Exception as e:
-        st.error("Erro ao processar. Veja detalhes abaixo:")
-        st.exception(e)
-else:
-    st.info("Faça upload dos 2 arquivos na barra lateral e clique em **Rodar alocação**.")
+        st.divider()
+        st.subheader("Saldo do plano")
+        st.dataframe(saldo_plano, use_container_width=True, hide_index=True)
+
+    else:
+        st.subheader("Análises de distribuição")
+
+        # KPI rápidos (derivados das análises, quando disponíveis)
+        if "Resumo_Frota" in analyses and isinstance(analyses["Resumo_Frota"], pd.DataFrame) and not analyses["Resumo_Frota"].empty:
+            rf = analyses["Resumo_Frota"].copy()
+            total_oferta = float(rf["Oferta"].sum()) if "Oferta" in rf.columns else 0.0
+            total_usado = float(rf["Usado"].sum()) if "Usado" in rf.columns else 0.0
+            total_saldo = float(rf["Saldo"].sum()) if "Saldo" in rf.columns else 0.0
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Oferta total (plano)", f"{int(total_oferta)}")
+            c2.metric("Usado total", f"{int(total_usado)}")
+            c3.metric("Saldo total", f"{int(total_saldo)}")
+
+        # Seletor de tabela
+        keys = list(analyses.keys())
+        if not keys:
+            st.warning("Nenhuma análise foi gerada.")
+        else:
+            default_key = "Distribuicao_Transportadora" if "Distribuicao_Transportadora" in keys else keys[0]
+            pick = st.selectbox("Escolha uma análise", options=keys, index=keys.index(default_key))
+
+            df = analyses.get(pick)
+            if isinstance(df, pd.DataFrame):
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+                st.download_button(
+                    f"⬇️ Baixar '{pick}' (CSV)",
+                    data=to_csv_bytes(df),
+                    file_name=f"{pick}.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.write(df)
+
+            st.divider()
+            st.subheader("Download das análises (Excel)")
+
+            sheets = {"output_consolidado": output_consolidado, "saldo_plano": saldo_plano, **analyses}
+            excel_bytes = to_excel_bytes_multi(sheets)
+            st.download_button(
+                "⬇️ Baixar Excel (Output + Saldo + Análises)",
+                data=excel_bytes,
+                file_name="analises_distribuicao_frota.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
