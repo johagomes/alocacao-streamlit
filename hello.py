@@ -225,13 +225,28 @@ def is_big_vehicle_row(r):
 def selector_big(r):
     return is_big_vehicle_row(r)
 
-def allocate_one_best(plan_pool: pd.DataFrame, selector_fn, demand_cluster: str | None = None):
+def allocate_one_best(
+    plan_pool: pd.DataFrame,
+    selector_fn,
+    demand_cluster: str | None = None,
+    group_key: str | None = None,
+    tracker: dict | None = None,
+    group_supply: dict | None = None,
+):
+    """Seleciona 1 veículo respeitando:
+    - prioridade de frota (Kangu -> FF -> Spot -> Spot DPC)
+    - preferências de capacidade já existentes (cap_m3_eff/cap_kg_eff)
+    - Kangu NÃO pode fazer sinergia entre clusters
+    - NOVA REGRA: uso proporcional entre Transportadoras dentro da mesma região (grupo de sinergia),
+      aplicado PARA TODOS OS MODAIS (vehicle_class).
+        * A escolha do modal/porte (vehicle_class) segue a lógica original (capacidade).
+        * Depois disso, a Transportadora dentro desse modal é escolhida proporcionalmente ao saldo inicial
+          do bucket (group_key, vehicle_class, fleet_priority).
+    """
     eligible = plan_pool[(plan_pool["avail"] > 0)].copy()
     eligible = eligible[eligible.apply(selector_fn, axis=1)].copy()
 
     # Regra: Kangu NÃO pode fazer sinergia entre clusters.
-    # Ou seja: se o veículo for do tipo frota "KANGU", ele só pode ser alocado
-    # para o cluster de demanda original (Cluster == demand_cluster).
     if demand_cluster is not None and not eligible.empty:
         kangu_mask = eligible["Tipo Frota"].astype(str).str.upper().str.strip().eq("KANGU")
         eligible = pd.concat(
@@ -245,14 +260,69 @@ def allocate_one_best(plan_pool: pd.DataFrame, selector_fn, demand_cluster: str 
     if eligible.empty:
         return None, plan_pool
 
-    eligible = eligible.sort_values(
+    # Inicializa estruturas
+    if tracker is None:
+        tracker = {}
+    if group_supply is None:
+        group_supply = {}
+
+    # 1) Primeiro, decide QUAL modal/porte (vehicle_class) usaria, seguindo a lógica original
+    base_sorted = eligible.sort_values(
         ["fleet_priority", "cap_m3_eff", "cap_kg_eff", "avail"],
         ascending=[True, False, False, False],
     )
-    row = eligible.iloc[0]
+    base_row = base_sorted.iloc[0]
+    fp_target = int(base_row.get("fleet_priority", 9))
+    vc_target = str(base_row.get("vehicle_class", ""))
+
+    # 2) Dentro do mesmo (fleet_priority + vehicle_class), aplica proporcionalidade por transportadora
+    bucket = eligible[
+        (eligible["fleet_priority"].astype(int) == fp_target)
+        & (eligible["vehicle_class"].astype(str) == vc_target)
+    ].copy()
+
+    # fallback (não deveria acontecer)
+    if bucket.empty:
+        bucket = eligible.copy()
+
+    gk = str(group_key) if group_key is not None else ""
+
+    def usage_ratio_row(r):
+        vc = str(r.get("vehicle_class", ""))
+        fp = int(r.get("fleet_priority", 9))
+        tr = str(r.get("Transportadora", ""))
+        denom = float(group_supply.get((gk, vc, fp, tr), 0.0))
+        if denom <= 0:
+            denom = float(r.get("init_avail", 1)) if float(r.get("init_avail", 0) or 0) > 0 else 1.0
+        used = float(tracker.get((gk, vc, fp, tr), 0))
+        return used / denom
+
+    bucket["_usage_ratio"] = bucket.apply(usage_ratio_row, axis=1)
+    bucket["_used_abs"] = bucket.apply(
+        lambda r: float(tracker.get((gk, str(r.get("vehicle_class","")), int(r.get("fleet_priority",9)), str(r.get("Transportadora",""))), 0)),
+        axis=1
+    )
+
+    # Ordenação final:
+    # - menor ratio (para distribuir proporcional)
+    # - depois capacidade (mantém “maiores para ISs maiores” dentro do modal escolhido)
+    bucket = bucket.sort_values(
+        ["_usage_ratio", "cap_m3_eff", "cap_kg_eff", "_used_abs", "avail"],
+        ascending=[True, False, False, True, False],
+    )
+
+    row = bucket.iloc[0]
     idx = row.name
     plan_pool.loc[idx, "avail"] = int(plan_pool.loc[idx, "avail"]) - 1
+
+    # Atualiza tracker do bucket escolhido
+    vc = str(row.get("vehicle_class", ""))
+    fp = int(row.get("fleet_priority", 9))
+    tr = str(row.get("Transportadora", ""))
+    tracker[(gk, vc, fp, tr)] = int(tracker.get((gk, vc, fp, tr), 0)) + 1
+
     return row, plan_pool
+
 
 def cluster_demand_score(df_cluster: pd.DataFrame) -> float:
     """
@@ -270,6 +340,8 @@ def allocate_for_cluster(
     group_key: str,
     is_cluster: pd.DataFrame,
     plan_pool: pd.DataFrame,
+    group_supply: dict,
+    tracker: dict,
     all_scores: list,
     all_faltas: list,
 ):
@@ -307,7 +379,7 @@ def allocate_for_cluster(
         min_medio = required_units_by_capacity(sum_ov_kg, sum_ov_m3, MEDIO_BASE_KG_EFF, MEDIO_BASE_M3_EFF)
 
         for _ in range(min_medio):
-            row, plan_pool = allocate_one_best(plan_pool, selector_class("MEDIO"), demand_cluster=cluster_name)
+            row, plan_pool = allocate_one_best(plan_pool, selector_class("MEDIO"), demand_cluster=cluster_name, group_key=group_key, tracker=tracker, group_supply=group_supply)
             if row is None:
                 all_faltas.append({"Grupo_Sinergia": group_key, "Cluster": cluster_name, "HUB": hub, "Tipo": "MIN_MEDIO", "Faltou": 1})
                 break
@@ -339,7 +411,7 @@ def allocate_for_cluster(
             if hub_demand[hub]["rem_kg"] <= 1e-6 and hub_demand[hub]["rem_m3"] <= 1e-6:
                 break
 
-            row, plan_pool = allocate_one_best(plan_pool, selector_big, demand_cluster=cluster_name)
+            row, plan_pool = allocate_one_best(plan_pool, selector_big, demand_cluster=cluster_name, group_key=group_key, tracker=tracker, group_supply=group_supply)
             if row is None:
                 all_faltas.append({"Grupo_Sinergia": group_key, "Cluster": cluster_name, "HUB": hub, "Tipo": "EXTRA_BIG", "Faltou": 1})
                 break
@@ -365,7 +437,7 @@ def allocate_for_cluster(
         rem_m3 = float(hub_demand[hub]["rem_m3"])
 
         while rem_kg > 1e-6 or rem_m3 > 1e-6:
-            row, plan_pool = allocate_one_best(plan_pool, lambda r: True, demand_cluster=cluster_name)
+            row, plan_pool = allocate_one_best(plan_pool, lambda r: True, demand_cluster=cluster_name, group_key=group_key, tracker=tracker, group_supply=group_supply)
             if row is None:
                 records.append({
                     "Grupo_Sinergia": group_key,
@@ -446,6 +518,7 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
     plan["vehicle_class"] = plan["Modal"].map(vehicle_class)
     plan["fleet_priority"] = plan["Tipo Frota"].map(lambda x: FLEET_PRIORITY.get(str(x).upper(), 9))
     plan["avail"] = plan["Disponibilidade"].astype(int)
+    plan["init_avail"] = plan["avail"]
 
     isdata = is_df.rename(
         columns={
@@ -482,10 +555,24 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
         groups.setdefault(g, []).append(str(c))
 
     all_outputs, all_saldos, all_scores, all_faltas = [], [], [], []
+    tracker = {}
 
     # Processa por grupo (pool compartilhado dentro do grupo)
     for group_key, member_clusters in sorted(groups.items(), key=lambda x: x[0]):
         plan_pool = plan[plan["Cluster"].astype(str).isin(member_clusters)].copy()
+
+        # base de oferta inicial por transportadora (para distribuição proporcional)
+        # chave: (group_key, vehicle_class, fleet_priority, Transportadora) -> init_avail_total
+        group_supply = (
+            plan_pool.groupby(["vehicle_class", "fleet_priority", "Transportadora"], as_index=False)["init_avail"]
+            .sum()
+        )
+        group_supply = {(
+            str(group_key),
+            str(r["vehicle_class"]),
+            int(r["fleet_priority"]),
+            str(r["Transportadora"]),
+        ): float(r["init_avail"]) for _, r in group_supply.iterrows()}
 
         # ordem de alocação dos clusters dentro do grupo (maior demanda primeiro)
         demand_clusters = []
@@ -507,6 +594,8 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
                 group_key=str(group_key),
                 is_cluster=is_cluster,
                 plan_pool=plan_pool,
+                group_supply=group_supply,
+                tracker=tracker,
                 all_scores=all_scores,
                 all_faltas=all_faltas,
             )
