@@ -1133,5 +1133,3 @@ if run:
         st.exception(e)
 else:
     st.info("Faça upload dos 2 arquivos na barra lateral e clique em **Rodar alocação**.")
-
-
