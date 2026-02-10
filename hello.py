@@ -12,11 +12,13 @@ import streamlit as st
 OCCUPANCY_M3 = 0.90
 OCCUPANCY_KG = 0.90
 
+# ✅ NOVA PRIORIDADE + SHIFT DAS DEMAIS
 FLEET_PRIORITY = {
-    "KANGU": 1,
-    "FF": 2,
-    "SPOT": 3,
-    "SPOT DPC": 4,  # <- última prioridade
+    "KANGU DPC XD": 1,
+    "KANGU": 2,
+    "FF": 3,
+    "SPOT": 4,
+    "SPOT DPC": 5,  # <- última prioridade
 }
 
 # ✅ AJUSTE: capacidades (kg) atualizadas para os modais solicitados (1800 kg)
@@ -83,6 +85,13 @@ def is_electric_modal(modal: str) -> bool:
     """
     m = norm(modal)
     return (m in ELECTRIC_MODALS_NORM) or ("ELETRIC" in m)
+
+
+# =========================
+# ✅ REGRA HUB x KANGU DPC XD (SÓ BRRC02)
+# =========================
+KANGU_DPC_XD_ALLOWED_HUB = "BRRC02"
+KANGU_DPC_XD_FROTA_NORM = norm("Kangu DPC XD")
 
 
 def cluster_synergy_key(cluster: str) -> str:
@@ -314,7 +323,7 @@ def allocate_one_best(
     group_supply: dict | None = None,
 ):
     """Seleciona 1 veículo respeitando:
-    - prioridade de frota (Kangu -> FF -> Spot -> Spot DPC)
+    - prioridade de frota (Kangu DPC XD -> Kangu -> FF -> Spot -> Spot DPC)
     - preferências de capacidade já existentes (cap_m3_eff/cap_kg_eff)
     - Kangu NÃO pode fazer sinergia entre clusters
     - uso proporcional entre Transportadoras dentro do mesmo grupo de sinergia,
@@ -322,6 +331,8 @@ def allocate_one_best(
     - ✅ Elétricos (Vuc EL / Melione VUC Elétrico / VUC Elétrico):
         * só podem rodar no HUB BRRC01
         * se o HUB é BRRC01 e há elétrico disponível elegível, ele é obrigatório (prioridade absoluta)
+    - ✅ "Kangu DPC XD":
+        * só pode rodar no HUB BRRC02
     """
     eligible = plan_pool[(plan_pool["avail"] > 0)].copy()
     eligible = eligible[eligible.apply(selector_fn, axis=1)].copy()
@@ -331,6 +342,14 @@ def allocate_one_best(
         hub_norm = norm(demand_hub)
         if hub_norm != norm(ELECTRIC_ALLOWED_HUB):
             eligible = eligible[~eligible["Modal"].map(is_electric_modal)].copy()
+
+    # ✅ Regra: "Kangu DPC XD" só pode rodar no HUB BRRC02
+    if demand_hub is not None:
+        hub_norm = norm(demand_hub)
+        if hub_norm != norm(KANGU_DPC_XD_ALLOWED_HUB):
+            eligible = eligible[
+                eligible["Tipo Frota"].astype(str).map(norm) != KANGU_DPC_XD_FROTA_NORM
+            ].copy()
 
     # ✅ Regra: no BRRC01, se existir elétrico elegível e prefer_electric_first=True, ele é obrigatório
     if demand_hub is not None and norm(demand_hub) == norm(ELECTRIC_ALLOWED_HUB) and prefer_electric_first:
@@ -814,8 +833,8 @@ def build_analyses(output_final: pd.DataFrame, saldo_final: pd.DataFrame, debug_
     ) if not used_rows.empty else pd.DataFrame(columns=["Tipo Frota", "Usado"])
 
     saldo = (
-        saldo_final.groupby(["Tipo Frota"], as_index=False)["Disponibilidade_Restante"].sum().rename(columns={"Disponibilidade_Restante": "Saldo"})
-    ) if saldo_final is not None and not saldo_final.empty else pd.DataFrame(columns=["Tipo Frota", "Saldo"])
+        saldo_final.groupby(["Tipo Frota"], as_index=False)["Disponibilidade_Restante"].sum().rename(columns={"Disponibilidade_Restante": "Saldo"}))
+    if saldo_final is not None and not saldo_final.empty else pd.DataFrame(columns=["Tipo Frota", "Saldo"])
 
     resumo_frota = (oferta.merge(usado, on="Tipo Frota", how="outer").merge(saldo, on="Tipo Frota", how="outer").fillna(0))
     resumo_frota["Utilizacao_%"] = resumo_frota.apply(lambda r: _safe_pct(r.get("Usado", 0), r.get("Oferta", 0)), axis=1)
@@ -1089,6 +1108,8 @@ with st.sidebar:
     st.write(f"- OCCUPANCY_M3: {OCCUPANCY_M3}")
     st.write(f"- OCCUPANCY_KG: {OCCUPANCY_KG}")
     st.write(f"- MIN_MEDIO OVERSIZE: >= {MIN_MEDIO_OVERSIZE_M3} m³ ou >= {MIN_MEDIO_OVERSIZE_KG} kg")
+    st.write(f"- HUB elétricos: {ELECTRIC_ALLOWED_HUB}")
+    st.write(f"- HUB Kangu DPC XD: {KANGU_DPC_XD_ALLOWED_HUB}")
 
     enable_synergy = st.checkbox(
         "Ativar sinergia: clusters com mesmo prefixo antes do ponto (ex: 'CLUSTER 1.x')",
