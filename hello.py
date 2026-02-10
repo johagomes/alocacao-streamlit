@@ -12,13 +12,11 @@ import streamlit as st
 OCCUPANCY_M3 = 0.90
 OCCUPANCY_KG = 0.90
 
-# ✅ NOVA PRIORIDADE + SHIFT DAS DEMAIS
 FLEET_PRIORITY = {
-    "KANGU DPC XD": 1,
-    "KANGU": 2,
-    "FF": 3,
-    "SPOT": 4,
-    "SPOT DPC": 5,  # <- última prioridade
+    "KANGU": 1,
+    "FF": 2,
+    "SPOT": 3,
+    "SPOT DPC": 4,  # <- última prioridade
 }
 
 # ✅ AJUSTE: capacidades (kg) atualizadas para os modais solicitados (1800 kg)
@@ -28,11 +26,13 @@ CAPACITY_ROWS = [
     ("Médio", 25, 3500),
     ("Truck", 50, 12000),
     ("Carreta", 90, 24000),
+
     ("Vuc EL", 16, 1600),
     ("VUC com ajudante", 17, 1400),
     ("HR", 12, 1800),
     ("M1 Rental Médio DD*FM", 37, 3500),
     ("Toco", 40, 6000),
+
     ("MELIONE RENTAL VAN", 8, 2200),
     ("M1 Rental Vuc DD*FM", 17, 1600),
 
@@ -63,27 +63,6 @@ def norm(s: str) -> str:
     return s
 
 
-def find_col(df, candidates):
-    cols_norm = {norm(c): c for c in df.columns}
-    for cand in candidates:
-        c = cols_norm.get(norm(cand))
-        if c is not None:
-            return c
-    for cand in candidates:
-        cn = norm(cand)
-        for k, orig in cols_norm.items():
-            if cn in k:
-                return orig
-    return None
-
-
-def parse_number_series(s: pd.Series) -> pd.Series:
-    x = s.astype(str).str.strip()
-    x = x.str.replace(".", "", regex=False)
-    x = x.str.replace(",", ".", regex=False)
-    return pd.to_numeric(x, errors="coerce")
-
-
 # =========================
 # REGRA HUB x ELÉTRICOS (OBRIGATÓRIO EM BRRC01)
 # =========================
@@ -104,13 +83,6 @@ def is_electric_modal(modal: str) -> bool:
     """
     m = norm(modal)
     return (m in ELECTRIC_MODALS_NORM) or ("ELETRIC" in m)
-
-
-# =========================
-# ✅ REGRA HUB x KANGU DPC XD (SÓ BRRC02)
-# =========================
-KANGU_DPC_XD_ALLOWED_HUB = "BRRC02"
-KANGU_DPC_XD_FROTA_NORM = norm("Kangu DPC XD")
 
 
 def cluster_synergy_key(cluster: str) -> str:
@@ -183,20 +155,47 @@ def capacity_for_modal(modal: str):
     return np.nan, np.nan, None
 
 
+def find_col(df, candidates):
+    cols_norm = {norm(c): c for c in df.columns}
+    for cand in candidates:
+        c = cols_norm.get(norm(cand))
+        if c is not None:
+            return c
+    for cand in candidates:
+        cn = norm(cand)
+        for k, orig in cols_norm.items():
+            if cn in k:
+                return orig
+    return None
+
+
+def parse_number_series(s: pd.Series) -> pd.Series:
+    x = s.astype(str).str.strip()
+    x = x.str.replace(".", "", regex=False)
+    x = x.str.replace(",", ".", regex=False)
+    return pd.to_numeric(x, errors="coerce")
+
+
 # =========================
 # CAPACIDADES EFETIVAS
 # =========================
+# ✅ Ajuste de baseline do VUC para 1800 kg (efetivo = 1800 * OCCUPANCY_KG)
 VUC_BASE_M3_EFF = 16 * OCCUPANCY_M3
 VUC_BASE_KG_EFF = 1800 * OCCUPANCY_KG
 
 MEDIO_BASE_M3_EFF = 37 * OCCUPANCY_M3
 MEDIO_BASE_KG_EFF = 3500 * OCCUPANCY_KG
 
+# ✅ NOVA REGRA do MIN_MEDIO (oversize nominal)
 MIN_MEDIO_OVERSIZE_M3 = 16.0
 MIN_MEDIO_OVERSIZE_KG = 1800.0
 
 
 def split_oversize_vs_vuc(is_hub: pd.DataFrame):
+    """
+    ✅ Regra MIN_MEDIO:
+    tudo que tiver >= 16 m3 OU >= 1800 kg entra no bloco obrigatório de MIN_MEDIO
+    """
     overs = is_hub[
         (is_hub["Peso_kg"] >= MIN_MEDIO_OVERSIZE_KG)
         | (is_hub["Volume_m3"] >= MIN_MEDIO_OVERSIZE_M3)
@@ -218,6 +217,7 @@ def hub_tail_score(is_hub: pd.DataFrame):
     kg = is_hub["Peso_kg"].astype(float)
     m3 = is_hub["Volume_m3"].astype(float)
 
+    # (mantém lógica de score baseada na baseline efetiva do VUC)
     overs = (kg > VUC_BASE_KG_EFF) | (m3 > VUC_BASE_M3_EFF)
     fits = ~overs
     df_fit = is_hub[fits].copy()
@@ -307,30 +307,32 @@ def allocate_one_best(
     plan_pool: pd.DataFrame,
     selector_fn,
     demand_cluster: str | None = None,
-    demand_hub: str | None = None,
-    prefer_electric_first: bool = False,
+    demand_hub: str | None = None,            # ✅ NOVO
+    prefer_electric_first: bool = False,      # ✅ NOVO (apenas quando hub == BRRC01)
     group_key: str | None = None,
     tracker: dict | None = None,
     group_supply: dict | None = None,
 ):
+    """Seleciona 1 veículo respeitando:
+    - prioridade de frota (Kangu -> FF -> Spot -> Spot DPC)
+    - preferências de capacidade já existentes (cap_m3_eff/cap_kg_eff)
+    - Kangu NÃO pode fazer sinergia entre clusters
+    - uso proporcional entre Transportadoras dentro do mesmo grupo de sinergia,
+      aplicado PARA TODOS OS MODAIS (vehicle_class).
+    - ✅ Elétricos (Vuc EL / Melione VUC Elétrico / VUC Elétrico):
+        * só podem rodar no HUB BRRC01
+        * se o HUB é BRRC01 e há elétrico disponível elegível, ele é obrigatório (prioridade absoluta)
+    """
     eligible = plan_pool[(plan_pool["avail"] > 0)].copy()
     eligible = eligible[eligible.apply(selector_fn, axis=1)].copy()
 
-    # ✅ Elétricos só no BRRC01
+    # ✅ Regra: elétricos só podem rodar no HUB BRRC01
     if demand_hub is not None:
         hub_norm = norm(demand_hub)
         if hub_norm != norm(ELECTRIC_ALLOWED_HUB):
             eligible = eligible[~eligible["Modal"].map(is_electric_modal)].copy()
 
-    # ✅ Kangu DPC XD só no BRRC02
-    if demand_hub is not None:
-        hub_norm = norm(demand_hub)
-        if hub_norm != norm(KANGU_DPC_XD_ALLOWED_HUB):
-            eligible = eligible[
-                eligible["Tipo Frota"].astype(str).map(norm) != KANGU_DPC_XD_FROTA_NORM
-            ].copy()
-
-    # ✅ no BRRC01, se existir elétrico elegível e prefer_electric_first=True, ele é obrigatório
+    # ✅ Regra: no BRRC01, se existir elétrico elegível e prefer_electric_first=True, ele é obrigatório
     if demand_hub is not None and norm(demand_hub) == norm(ELECTRIC_ALLOWED_HUB) and prefer_electric_first:
         electric_only = eligible[eligible["Modal"].map(is_electric_modal)].copy()
         if not electric_only.empty:
@@ -355,6 +357,7 @@ def allocate_one_best(
     if group_supply is None:
         group_supply = {}
 
+    # 1) Decide o bucket (fleet_priority + vehicle_class)
     base_sorted = eligible.sort_values(
         ["fleet_priority", "cap_m3_eff", "cap_kg_eff", "avail"],
         ascending=[True, False, False, False],
@@ -363,6 +366,7 @@ def allocate_one_best(
     fp_target = int(base_row.get("fleet_priority", 9))
     vc_target = str(base_row.get("vehicle_class", ""))
 
+    # 2) Proporcionalidade por transportadora dentro do bucket
     bucket = eligible[
         (eligible["fleet_priority"].astype(int) == fp_target)
         & (eligible["vehicle_class"].astype(str) == vc_target)
@@ -456,7 +460,7 @@ def allocate_for_cluster(
             "ov_m3": float(overs["Volume_m3"].sum()),
         }
 
-    # 2) MIN_MEDIO (obrigatório)
+    # 2) MIN_MEDIO (obrigatório) - oversize pela regra nova (>=16m3 OU >=1800kg)
     for hub in sorted(hub_demand.keys()):
         prefer_el = (norm(hub) == norm(ELECTRIC_ALLOWED_HUB))
 
@@ -499,6 +503,7 @@ def allocate_for_cluster(
 
     for hub, _ in hubs_sorted:
         prefer_el = (norm(hub) == norm(ELECTRIC_ALLOWED_HUB))
+
         extra_units = int(extras_by_hub.get(hub, 0))
         if extra_units <= 0:
             continue
@@ -539,6 +544,7 @@ def allocate_for_cluster(
     # 4) MIN_FILL
     for hub in sorted(hub_demand.keys()):
         prefer_el = (norm(hub) == norm(ELECTRIC_ALLOWED_HUB))
+
         rem_kg = float(hub_demand[hub]["rem_kg"])
         rem_m3 = float(hub_demand[hub]["rem_m3"])
 
@@ -585,7 +591,7 @@ def allocate_for_cluster(
         hub_demand[hub]["rem_kg"] = rem_kg
         hub_demand[hub]["rem_m3"] = rem_m3
 
-    # Auditoria: elétrico sobrando no plano
+    # ✅ Auditoria: se sobrou elétrico no plano, ele "deveria rodar no BRRC01", mas não teve como consumir
     left_el = plan_pool[(plan_pool["avail"] > 0) & (plan_pool["Modal"].map(is_electric_modal))].copy()
     if not left_el.empty:
         sobraram = int(left_el["avail"].sum())
@@ -661,10 +667,14 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
     isdata["Volume_m3"] = parse_number_series(isdata["Volume_m3"])
     isdata = isdata.dropna(subset=["Cluster", "HUB", "Peso_kg", "Volume_m3"]).copy()
 
+    # Apenas clusters que existem nos dois lados (igualdade exata)
     common_clusters = sorted(list(set(plan["Cluster"].astype(str)).intersection(set(isdata["Cluster"].astype(str)))))
     if not common_clusters:
         raise ValueError("Não encontrei clusters em comum entre Plano e ISs.")
 
+    # =========================
+    # SINERGIA POR PREFIXO (antes do ponto)
+    # =========================
     if enable_synergy:
         plan["Grupo_Sinergia"] = plan["Cluster"].map(cluster_synergy_key)
         isdata["Grupo_Sinergia"] = isdata["Cluster"].map(cluster_synergy_key)
@@ -672,6 +682,7 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
         plan["Grupo_Sinergia"] = plan["Cluster"].astype(str)
         isdata["Grupo_Sinergia"] = isdata["Cluster"].astype(str)
 
+    # Grupos só com clusters em comum
     groups = {}
     for c in common_clusters:
         g = cluster_synergy_key(c) if enable_synergy else str(c)
@@ -680,18 +691,21 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
     all_allocs, all_saldos, all_scores, all_faltas = [], [], [], []
     tracker = {}
 
+    # Processa por grupo (pool compartilhado dentro do grupo)
     for group_key, member_clusters in sorted(groups.items(), key=lambda x: x[0]):
         plan_pool = plan[plan["Cluster"].astype(str).isin(member_clusters)].copy()
 
-        group_supply_df = (
+        # base de oferta inicial por transportadora (para distribuição proporcional)
+        group_supply = (
             plan_pool.groupby(["vehicle_class", "fleet_priority", "Transportadora"], as_index=False)["init_avail"]
             .sum()
         )
         group_supply = {
             (str(group_key), str(r["vehicle_class"]), int(r["fleet_priority"]), str(r["Transportadora"])): float(r["init_avail"])
-            for _, r in group_supply_df.iterrows()
+            for _, r in group_supply.iterrows()
         }
 
+        # ordem de alocação dos clusters dentro do grupo (maior demanda primeiro)
         demand_clusters = []
         for c in member_clusters:
             df_c = isdata[isdata["Cluster"].astype(str) == str(c)].copy()
@@ -700,6 +714,7 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
             demand_clusters.append((c, cluster_demand_score(df_c)))
         demand_clusters.sort(key=lambda x: x[1], reverse=True)
 
+        # roda cada cluster (demanda) usando o MESMO pool
         for cluster_name, _score in demand_clusters:
             is_cluster = isdata[isdata["Cluster"].astype(str) == str(cluster_name)].copy()
             if is_cluster.empty or plan_pool.empty:
@@ -717,9 +732,11 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
             )
 
             alloc_df = pd.DataFrame(records)
-            if not alloc_df.empty:
-                all_allocs.append(alloc_df)
+            if alloc_df.empty:
+                continue
+            all_allocs.append(alloc_df)
 
+        # saldo do pool ao final do grupo
         if not plan_pool.empty:
             saldo = (
                 plan_pool.groupby(["Grupo_Sinergia", "Cluster", "Transportadora", "Tipo Frota", "Modal"], as_index=False)["avail"]
@@ -732,6 +749,9 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
     debug_alloc = pd.concat(all_allocs, ignore_index=True) if all_allocs else pd.DataFrame()
     saldo_debug = pd.concat(all_saldos, ignore_index=True) if all_saldos else pd.DataFrame()
 
+    # =========================
+    # OUTPUT FINAL
+    # =========================
     if debug_alloc.empty:
         final_output = pd.DataFrame(columns=["Cluster", "HUB", "Transportadora", "Tipo Frota", "Modal", "Veiculos"])
     else:
@@ -750,11 +770,13 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
             .sort_values(["Cluster", "Tipo Frota", "Transportadora", "Modal"], ascending=[True, True, True, True])
         )
 
+    # ✅ AJUSTE ANTERIOR: saldo_plano só com Disponibilidade_Restante >= 1
     if not final_saldo.empty:
         final_saldo = final_saldo[final_saldo["Disponibilidade_Restante"] >= 1].copy()
 
     if return_debug:
         plan_common = plan[plan["Cluster"].astype(str).isin(common_clusters)].copy()
+        # ✅ NOVO: retorna também isdata normalizado pra análises de demanda x capacidade x plano
         return final_output, final_saldo, debug_alloc, saldo_debug, plan_common, isdata
 
     return final_output, final_saldo
@@ -768,9 +790,6 @@ def _safe_pct(num, den):
     return float(num) / float(den) if den and den != 0 else 0.0
 
 
-# =========================
-# ✅ build_analyses (CORRIGIDA)
-# =========================
 def build_analyses(output_final: pd.DataFrame, saldo_final: pd.DataFrame, debug_alloc: pd.DataFrame, plan_common: pd.DataFrame) -> dict:
     analyses = {}
 
@@ -788,111 +807,57 @@ def build_analyses(output_final: pd.DataFrame, saldo_final: pd.DataFrame, debug_
     if not used_rows.empty:
         used_rows["vehicle_class"] = used_rows["Modal"].map(vehicle_class)
 
-    oferta = (
-        plan_common.groupby(["Tipo Frota"], as_index=False)["Disponibilidade"]
-        .sum()
-        .rename(columns={"Disponibilidade": "Oferta"})
-    )
-
+    oferta = (plan_common.groupby(["Tipo Frota"], as_index=False)["Disponibilidade"].sum().rename(columns={"Disponibilidade": "Oferta"}))
     usado = (
         used_rows.loc[~used_rows["Transportadora"].astype(str).str.contains(r"\(SEM OFERTA\)", regex=True), :]
-        .groupby(["Tipo Frota"], as_index=False)["Veiculos"]
-        .sum()
-        .rename(columns={"Veiculos": "Usado"})
+        .groupby(["Tipo Frota"], as_index=False)["Veiculos"].sum().rename(columns={"Veiculos": "Usado"})
     ) if not used_rows.empty else pd.DataFrame(columns=["Tipo Frota", "Usado"])
 
-    # ✅ CORRIGIDO: sem ternário quebrado
-    if saldo_final is not None and not saldo_final.empty:
-        saldo = (
-            saldo_final.groupby(["Tipo Frota"], as_index=False)["Disponibilidade_Restante"]
-            .sum()
-            .rename(columns={"Disponibilidade_Restante": "Saldo"})
-        )
-    else:
-        saldo = pd.DataFrame(columns=["Tipo Frota", "Saldo"])
+    saldo = (
+        saldo_final.groupby(["Tipo Frota"], as_index=False)["Disponibilidade_Restante"].sum().rename(columns={"Disponibilidade_Restante": "Saldo"})
+    ) if saldo_final is not None and not saldo_final.empty else pd.DataFrame(columns=["Tipo Frota", "Saldo"])
 
-    resumo_frota = (
-        oferta.merge(usado, on="Tipo Frota", how="outer")
-        .merge(saldo, on="Tipo Frota", how="outer")
-        .fillna(0)
-    )
+    resumo_frota = (oferta.merge(usado, on="Tipo Frota", how="outer").merge(saldo, on="Tipo Frota", how="outer").fillna(0))
     resumo_frota["Utilizacao_%"] = resumo_frota.apply(lambda r: _safe_pct(r.get("Usado", 0), r.get("Oferta", 0)), axis=1)
     analyses["Resumo_Frota"] = resumo_frota.sort_values(["Tipo Frota"], ascending=True)
 
-    oferta_cls = (
-        plan_common.groupby(["Tipo Frota", "vehicle_class"], as_index=False)["Disponibilidade"]
-        .sum()
-        .rename(columns={"Disponibilidade": "Oferta"})
-    )
-
+    oferta_cls = (plan_common.groupby(["Tipo Frota", "vehicle_class"], as_index=False)["Disponibilidade"].sum().rename(columns={"Disponibilidade": "Oferta"}))
     usado_cls = (
         used_rows.loc[~used_rows["Transportadora"].astype(str).str.contains(r"\(SEM OFERTA\)", regex=True), :]
-        .groupby(["Tipo Frota", "vehicle_class"], as_index=False)["Veiculos"]
-        .sum()
-        .rename(columns={"Veiculos": "Usado"})
+        .groupby(["Tipo Frota", "vehicle_class"], as_index=False)["Veiculos"].sum().rename(columns={"Veiculos": "Usado"})
     ) if not used_rows.empty else pd.DataFrame(columns=["Tipo Frota", "vehicle_class", "Usado"])
 
     saldo_cls = pd.DataFrame(columns=["Tipo Frota", "vehicle_class", "Saldo"])
     if saldo_final is not None and not saldo_final.empty:
         tmp = saldo_final.copy()
         tmp["vehicle_class"] = tmp["Modal"].map(vehicle_class)
-        saldo_cls = (
-            tmp.groupby(["Tipo Frota", "vehicle_class"], as_index=False)["Disponibilidade_Restante"]
-            .sum()
-            .rename(columns={"Disponibilidade_Restante": "Saldo"})
-        )
+        saldo_cls = (tmp.groupby(["Tipo Frota", "vehicle_class"], as_index=False)["Disponibilidade_Restante"].sum().rename(columns={"Disponibilidade_Restante": "Saldo"}))
 
-    resumo_cls = (
-        oferta_cls.merge(usado_cls, on=["Tipo Frota", "vehicle_class"], how="outer")
-        .merge(saldo_cls, on=["Tipo Frota", "vehicle_class"], how="outer")
-        .fillna(0)
-    )
+    resumo_cls = (oferta_cls.merge(usado_cls, on=["Tipo Frota", "vehicle_class"], how="outer")
+                  .merge(saldo_cls, on=["Tipo Frota", "vehicle_class"], how="outer").fillna(0))
     resumo_cls["Utilizacao_%"] = resumo_cls.apply(lambda r: _safe_pct(r.get("Usado", 0), r.get("Oferta", 0)), axis=1)
     analyses["Resumo_Classe"] = resumo_cls.sort_values(["Tipo Frota", "vehicle_class"], ascending=True)
 
     analyses["Uso_Cluster_Frota"] = (
-        used_rows.groupby(["Cluster", "Tipo Frota"], as_index=False)["Veiculos"]
-        .sum()
-        .sort_values(["Cluster", "Tipo Frota"], ascending=True)
+        used_rows.groupby(["Cluster", "Tipo Frota"], as_index=False)["Veiculos"].sum().sort_values(["Cluster", "Tipo Frota"], ascending=True)
     ) if not used_rows.empty else pd.DataFrame(columns=["Cluster", "Tipo Frota", "Veiculos"])
 
     analyses["Uso_HUB_Frota"] = (
-        used_rows.groupby(["HUB", "Tipo Frota"], as_index=False)["Veiculos"]
-        .sum()
-        .sort_values(["HUB", "Tipo Frota"], ascending=True)
+        used_rows.groupby(["HUB", "Tipo Frota"], as_index=False)["Veiculos"].sum().sort_values(["HUB", "Tipo Frota"], ascending=True)
     ) if not used_rows.empty else pd.DataFrame(columns=["HUB", "Tipo Frota", "Veiculos"])
 
-    oferta_car = (
-        plan_common.groupby(["Transportadora", "Tipo Frota"], as_index=False)["Disponibilidade"]
-        .sum()
-        .rename(columns={"Disponibilidade": "Oferta"})
-    )
+    oferta_car = plan_common.groupby(["Transportadora", "Tipo Frota"], as_index=False)["Disponibilidade"].sum().rename(columns={"Disponibilidade": "Oferta"})
     usado_car = (
         used_rows.loc[~used_rows["Transportadora"].astype(str).str.contains(r"\(SEM OFERTA\)", regex=True), :]
-        .groupby(["Transportadora", "Tipo Frota"], as_index=False)["Veiculos"]
-        .sum()
-        .rename(columns={"Veiculos": "Usado"})
+        .groupby(["Transportadora", "Tipo Frota"], as_index=False)["Veiculos"].sum().rename(columns={"Veiculos": "Usado"})
     ) if not used_rows.empty else pd.DataFrame(columns=["Transportadora", "Tipo Frota", "Usado"])
 
+    saldo_car = pd.DataFrame(columns=["Transportadora", "Tipo Frota", "Saldo"])
     if saldo_final is not None and not saldo_final.empty:
-        saldo_car = (
-            saldo_final.groupby(["Transportadora", "Tipo Frota"], as_index=False)["Disponibilidade_Restante"]
-            .sum()
-            .rename(columns={"Disponibilidade_Restante": "Saldo"})
-        )
-    else:
-        saldo_car = pd.DataFrame(columns=["Transportadora", "Tipo Frota", "Saldo"])
+        saldo_car = saldo_final.groupby(["Transportadora", "Tipo Frota"], as_index=False)["Disponibilidade_Restante"].sum().rename(columns={"Disponibilidade_Restante": "Saldo"})
 
-    dist_car = (
-        oferta_car.merge(usado_car, on=["Transportadora", "Tipo Frota"], how="outer")
-        .merge(saldo_car, on=["Transportadora", "Tipo Frota"], how="outer")
-        .fillna(0)
-    )
-    dist_car_tot = (
-        dist_car.groupby(["Tipo Frota"], as_index=False)[["Oferta", "Usado", "Saldo"]]
-        .sum()
-        .rename(columns={"Oferta": "Oferta_Total", "Usado": "Usado_Total", "Saldo": "Saldo_Total"})
-    )
+    dist_car = oferta_car.merge(usado_car, on=["Transportadora", "Tipo Frota"], how="outer").merge(saldo_car, on=["Transportadora", "Tipo Frota"], how="outer").fillna(0)
+    dist_car_tot = dist_car.groupby(["Tipo Frota"], as_index=False)[["Oferta", "Usado", "Saldo"]].sum().rename(columns={"Oferta": "Oferta_Total", "Usado": "Usado_Total", "Saldo": "Saldo_Total"})
     dist_car = dist_car.merge(dist_car_tot, on="Tipo Frota", how="left")
     dist_car["Oferta_%"] = dist_car.apply(lambda r: _safe_pct(r.get("Oferta", 0), r.get("Oferta_Total", 0)), axis=1)
     dist_car["Uso_%"] = dist_car.apply(lambda r: _safe_pct(r.get("Usado", 0), r.get("Usado_Total", 0)), axis=1)
@@ -901,9 +866,7 @@ def build_analyses(output_final: pd.DataFrame, saldo_final: pd.DataFrame, debug_
 
     analyses["Uso_Cluster_Transportadora"] = (
         used_rows.loc[~used_rows["Transportadora"].astype(str).str.contains(r"\(SEM OFERTA\)", regex=True), :]
-        .groupby(["Cluster", "Transportadora"], as_index=False)["Veiculos"]
-        .sum()
-        .sort_values(["Cluster", "Veiculos"], ascending=[True, False])
+        .groupby(["Cluster", "Transportadora"], as_index=False)["Veiculos"].sum().sort_values(["Cluster", "Veiculos"], ascending=[True, False])
     ) if not used_rows.empty else pd.DataFrame(columns=["Cluster", "Transportadora", "Veiculos"])
 
     sinergia = pd.DataFrame(columns=["Grupo_Sinergia", "Cluster", "Cluster_Oferta", "Tipo Frota", "vehicle_class", "Veiculos"])
@@ -913,34 +876,21 @@ def build_analyses(output_final: pd.DataFrame, saldo_final: pd.DataFrame, debug_
         tmp = tmp[(tmp["Cluster_Oferta"].astype(str) != tmp["Cluster"].astype(str))].copy()
         tmp = tmp[tmp["Tipo Frota"].astype(str).str.upper().str.strip() != "KANGU"]
         if not tmp.empty:
-            sinergia = (
-                tmp.groupby(["Grupo_Sinergia", "Cluster", "Cluster_Oferta", "Tipo Frota", "vehicle_class"], as_index=False)["Veiculos"]
-                .sum()
-                .sort_values(["Grupo_Sinergia", "Cluster", "Veiculos"], ascending=[True, True, False])
-            )
+            sinergia = (tmp.groupby(["Grupo_Sinergia", "Cluster", "Cluster_Oferta", "Tipo Frota", "vehicle_class"], as_index=False)["Veiculos"].sum()
+                        .sort_values(["Grupo_Sinergia", "Cluster", "Veiculos"], ascending=[True, True, False]))
     analyses["Sinergia_Emprestimos"] = sinergia
 
     prop = pd.DataFrame(columns=["Grupo_Sinergia", "Tipo Frota", "vehicle_class", "Transportadora", "Oferta", "Usado", "Oferta_%", "Uso_%", "Delta_pp"])
     if "Grupo_Sinergia" in plan_common.columns and not plan_common.empty and not used_rows.empty:
-        oferta_b = (
-            plan_common.groupby(["Grupo_Sinergia", "Tipo Frota", "vehicle_class", "Transportadora"], as_index=False)["Disponibilidade"]
-            .sum()
-            .rename(columns={"Disponibilidade": "Oferta"})
-        )
+        oferta_b = (plan_common.groupby(["Grupo_Sinergia", "Tipo Frota", "vehicle_class", "Transportadora"], as_index=False)["Disponibilidade"].sum()
+                    .rename(columns={"Disponibilidade": "Oferta"}))
         usado_b = debug_alloc.loc[~debug_alloc["Transportadora"].astype(str).str.contains(r"\(SEM OFERTA\)", regex=True), :].copy() if debug_alloc is not None and not debug_alloc.empty else pd.DataFrame()
         if not usado_b.empty:
             usado_b["vehicle_class"] = usado_b["Modal"].map(vehicle_class)
-            usado_b = (
-                usado_b.groupby(["Grupo_Sinergia", "Tipo Frota", "vehicle_class", "Transportadora"], as_index=False)["Veiculos"]
-                .sum()
-                .rename(columns={"Veiculos": "Usado"})
-            )
+            usado_b = (usado_b.groupby(["Grupo_Sinergia", "Tipo Frota", "vehicle_class", "Transportadora"], as_index=False)["Veiculos"].sum()
+                       .rename(columns={"Veiculos": "Usado"}))
             prop = oferta_b.merge(usado_b, on=["Grupo_Sinergia", "Tipo Frota", "vehicle_class", "Transportadora"], how="outer").fillna(0)
-            totals = (
-                prop.groupby(["Grupo_Sinergia", "Tipo Frota", "vehicle_class"], as_index=False)[["Oferta", "Usado"]]
-                .sum()
-                .rename(columns={"Oferta": "Oferta_Total", "Usado": "Usado_Total"})
-            )
+            totals = prop.groupby(["Grupo_Sinergia", "Tipo Frota", "vehicle_class"], as_index=False)[["Oferta", "Usado"]].sum().rename(columns={"Oferta": "Oferta_Total", "Usado": "Usado_Total"})
             prop = prop.merge(totals, on=["Grupo_Sinergia", "Tipo Frota", "vehicle_class"], how="left")
             prop["Oferta_%"] = prop.apply(lambda r: _safe_pct(r.get("Oferta", 0), r.get("Oferta_Total", 0)), axis=1)
             prop["Uso_%"] = prop.apply(lambda r: _safe_pct(r.get("Usado", 0), r.get("Usado_Total", 0)), axis=1)
@@ -962,11 +912,16 @@ def to_excel_bytes_multi(sheets: dict) -> bytes:
 
 
 # =========================
-# ✅ DEMANDA (ISsDia) x OUTPUT x PLANOROTAS
+# ✅ NOVO BLOCO: DEMANDA (ISsDia) x OUTPUT x PLANOROTAS
 # =========================
 def _add_caps_to_output(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enriquecer output_consolidado/debug_alloc com capacidade efetiva por linha
+    (m3/kg) de acordo com o Modal.
+    """
     if df is None:
         return pd.DataFrame()
+
     if df.empty:
         tmp = df.copy()
         tmp["cap_m3_eff"] = []
@@ -988,6 +943,13 @@ def build_demand_vs_output_vs_plan(
     plan_common: pd.DataFrame,
     saldo_final: pd.DataFrame,
 ) -> dict:
+    """
+    Tabelas para checar:
+    - Demanda (ISsDia) em m3/kg
+    - Capacidade alocada (output) em m3/kg
+    - Oferta (PlanoRotas) e Saldo (saldo_plano)
+    - Flag de falta de disponibilidade (SEM OFERTA / gaps positivos)
+    """
     analyses = {}
 
     if isdata is None or isdata.empty:
@@ -996,6 +958,9 @@ def build_demand_vs_output_vs_plan(
         analyses["Faltas_Resumo_Cluster"] = pd.DataFrame()
         return analyses
 
+    # -------------------------
+    # Demanda por Cluster e por HUB
+    # -------------------------
     dem_cluster = (
         isdata.groupby(["Cluster"], as_index=False)
         .agg(Demanda_m3=("Volume_m3", "sum"), Demanda_kg=("Peso_kg", "sum"), ISs=("Volume_m3", "size"))
@@ -1006,6 +971,9 @@ def build_demand_vs_output_vs_plan(
         .agg(Demanda_m3=("Volume_m3", "sum"), Demanda_kg=("Peso_kg", "sum"), ISs=("Volume_m3", "size"))
     )
 
+    # -------------------------
+    # Output: capacidade alocada
+    # -------------------------
     out = output_final.copy() if output_final is not None else pd.DataFrame()
     if out.empty:
         out = pd.DataFrame(columns=["Cluster", "HUB", "Transportadora", "Tipo Frota", "Modal", "Veiculos"])
@@ -1036,6 +1004,9 @@ def build_demand_vs_output_vs_plan(
         )
     )
 
+    # -------------------------
+    # PlanoRotas: oferta + saldo (por Cluster)
+    # -------------------------
     if plan_common is None or plan_common.empty:
         oferta_cluster = pd.DataFrame(columns=["Cluster", "Oferta_PlanoRotas"])
     else:
@@ -1054,6 +1025,9 @@ def build_demand_vs_output_vs_plan(
             .rename(columns={"Disponibilidade_Restante": "Saldo_PlanoRotas"})
         )
 
+    # -------------------------
+    # Tabela Cluster: Demanda x Capacidade x Plano
+    # -------------------------
     cluster_tbl = (
         dem_cluster.merge(cap_cluster, on="Cluster", how="left")
         .merge(oferta_cluster, on="Cluster", how="left")
@@ -1070,6 +1044,9 @@ def build_demand_vs_output_vs_plan(
         | (cluster_tbl["Gap_kg"] > 1e-6)
     )
 
+    # -------------------------
+    # Tabela HUB: Demanda x Capacidade (Plano não é por HUB)
+    # -------------------------
     hub_tbl = (
         dem_hub.merge(cap_hub, on=["Cluster", "HUB"], how="left")
         .fillna(0)
@@ -1083,6 +1060,9 @@ def build_demand_vs_output_vs_plan(
         | (hub_tbl["Gap_kg"] > 1e-6)
     )
 
+    # -------------------------
+    # Resumo executivo de falta
+    # -------------------------
     faltas = cluster_tbl[cluster_tbl["Falta_Disponibilidade"]].copy()
     faltas = faltas.sort_values(["Veiculos_SemOferta", "Gap_m3", "Gap_kg"], ascending=[False, False, False])
 
@@ -1109,8 +1089,6 @@ with st.sidebar:
     st.write(f"- OCCUPANCY_M3: {OCCUPANCY_M3}")
     st.write(f"- OCCUPANCY_KG: {OCCUPANCY_KG}")
     st.write(f"- MIN_MEDIO OVERSIZE: >= {MIN_MEDIO_OVERSIZE_M3} m³ ou >= {MIN_MEDIO_OVERSIZE_KG} kg")
-    st.write(f"- HUB elétricos: {ELECTRIC_ALLOWED_HUB}")
-    st.write(f"- HUB Kangu DPC XD: {KANGU_DPC_XD_ALLOWED_HUB}")
 
     enable_synergy = st.checkbox(
         "Ativar sinergia: clusters com mesmo prefixo antes do ponto (ex: 'CLUSTER 1.x')",
@@ -1125,6 +1103,7 @@ if run:
             plan_df = pd.read_excel(plan_file)
             is_df = pd.read_excel(is_file)
 
+            # ✅ agora retorna isdata normalizado também
             output_consolidado, saldo_plano, debug_alloc, saldo_debug, plan_common, isdata_norm = run_allocation(
                 plan_df, is_df, enable_synergy=enable_synergy, return_debug=True
             )
@@ -1133,6 +1112,7 @@ if run:
 
         analyses = build_analyses(output_consolidado, saldo_plano, debug_alloc, plan_common)
 
+        # ✅ NOVO: adiciona diagnóstico Demanda x Output x PlanoRotas
         demand_checks = build_demand_vs_output_vs_plan(
             isdata=isdata_norm,
             output_final=output_consolidado,
@@ -1170,6 +1150,7 @@ if run:
 
             st.divider()
 
+            # ✅ NOVAS TABELAS (o que você pediu)
             st.subheader("✅ Demanda (ISsDia) x Capacidade Alocada (Output) x Plano de Rotas — por Cluster")
             st.dataframe(analyses.get("Demanda_vs_Capacidade_Cluster"), use_container_width=True, hide_index=True)
 
