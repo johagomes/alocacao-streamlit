@@ -1053,7 +1053,7 @@ if run:
                 mime="text/csv",
                 )
         st.divider()
-        sheets = {"output_consolidado": output_consolidado, "saldo_plано": saldo_plано, **analyses}
+        sheets = {"output_consolidado": output_consolidado, "saldo_plano": saldo_plano, **analyses}
         excel_bytes = to_excel_bytes_multi(sheets)
         st.download_button(
             "⬇️ Baixar Excel completo (todas as abas)",
