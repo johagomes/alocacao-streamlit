@@ -63,28 +63,6 @@ def norm(s: str) -> str:
     return s
 
 
-# =========================
-# REGRA HUB x ELÉTRICOS (OBRIGATÓRIO EM BRRC01)
-# =========================
-ELECTRIC_ALLOWED_HUB = "BRRC01"
-
-ELECTRIC_MODALS_NORM = {
-    norm("Vuc EL"),
-    norm("Melione VUC Elétrico"),
-    norm("VUC Elétrico"),
-}
-
-def is_electric_modal(modal: str) -> bool:
-    """
-    Considera elétrico se:
-    - estiver na lista fixa (Vuc EL / Melione VUC Elétrico / VUC Elétrico)
-    OU
-    - contiver 'ELETRIC' no texto (cobre variações como 'ELÉTRICO', etc.)
-    """
-    m = norm(modal)
-    return (m in ELECTRIC_MODALS_NORM) or ("ELETRIC" in m)
-
-
 def cluster_synergy_key(cluster: str) -> str:
     """
     Regra de sinergia:
@@ -307,8 +285,6 @@ def allocate_one_best(
     plan_pool: pd.DataFrame,
     selector_fn,
     demand_cluster: str | None = None,
-    demand_hub: str | None = None,            # ✅ NOVO
-    prefer_electric_first: bool = False,      # ✅ NOVO (apenas quando hub == BRRC01)
     group_key: str | None = None,
     tracker: dict | None = None,
     group_supply: dict | None = None,
@@ -319,24 +295,9 @@ def allocate_one_best(
     - Kangu NÃO pode fazer sinergia entre clusters
     - uso proporcional entre Transportadoras dentro do mesmo grupo de sinergia,
       aplicado PARA TODOS OS MODAIS (vehicle_class).
-    - ✅ Elétricos (Vuc EL / Melione VUC Elétrico / VUC Elétrico):
-        * só podem rodar no HUB BRRC01
-        * se o HUB é BRRC01 e há elétrico disponível elegível, ele é obrigatório (prioridade absoluta)
     """
     eligible = plan_pool[(plan_pool["avail"] > 0)].copy()
     eligible = eligible[eligible.apply(selector_fn, axis=1)].copy()
-
-    # ✅ Regra: elétricos só podem rodar no HUB BRRC01
-    if demand_hub is not None:
-        hub_norm = norm(demand_hub)
-        if hub_norm != norm(ELECTRIC_ALLOWED_HUB):
-            eligible = eligible[~eligible["Modal"].map(is_electric_modal)].copy()
-
-    # ✅ Regra: no BRRC01, se existir elétrico elegível e prefer_electric_first=True, ele é obrigatório
-    if demand_hub is not None and norm(demand_hub) == norm(ELECTRIC_ALLOWED_HUB) and prefer_electric_first:
-        electric_only = eligible[eligible["Modal"].map(is_electric_modal)].copy()
-        if not electric_only.empty:
-            eligible = electric_only
 
     # Regra: Kangu NÃO pode fazer sinergia entre clusters.
     if demand_cluster is not None and not eligible.empty:
@@ -462,8 +423,6 @@ def allocate_for_cluster(
 
     # 2) MIN_MEDIO (obrigatório) - oversize pela regra nova (>=16m3 OU >=1800kg)
     for hub in sorted(hub_demand.keys()):
-        prefer_el = (norm(hub) == norm(ELECTRIC_ALLOWED_HUB))
-
         sum_ov_kg = hub_demand[hub]["ov_kg"]
         sum_ov_m3 = hub_demand[hub]["ov_m3"]
         min_medio = required_units_by_capacity(sum_ov_kg, sum_ov_m3, MEDIO_BASE_KG_EFF, MEDIO_BASE_M3_EFF)
@@ -473,8 +432,6 @@ def allocate_for_cluster(
                 plan_pool,
                 selector_class("MEDIO"),
                 demand_cluster=cluster_name,
-                demand_hub=hub,
-                prefer_electric_first=prefer_el,
                 group_key=group_key,
                 tracker=tracker,
                 group_supply=group_supply,
@@ -502,8 +459,6 @@ def allocate_for_cluster(
     extras_by_hub = proportional_split(scores, needs, remaining_big_supply)
 
     for hub, _ in hubs_sorted:
-        prefer_el = (norm(hub) == norm(ELECTRIC_ALLOWED_HUB))
-
         extra_units = int(extras_by_hub.get(hub, 0))
         if extra_units <= 0:
             continue
@@ -516,8 +471,6 @@ def allocate_for_cluster(
                 plan_pool,
                 selector_big,
                 demand_cluster=cluster_name,
-                demand_hub=hub,
-                prefer_electric_first=prefer_el,
                 group_key=group_key,
                 tracker=tracker,
                 group_supply=group_supply,
@@ -543,8 +496,6 @@ def allocate_for_cluster(
 
     # 4) MIN_FILL
     for hub in sorted(hub_demand.keys()):
-        prefer_el = (norm(hub) == norm(ELECTRIC_ALLOWED_HUB))
-
         rem_kg = float(hub_demand[hub]["rem_kg"])
         rem_m3 = float(hub_demand[hub]["rem_m3"])
 
@@ -553,8 +504,6 @@ def allocate_for_cluster(
                 plan_pool,
                 lambda r: True,
                 demand_cluster=cluster_name,
-                demand_hub=hub,
-                prefer_electric_first=prefer_el,
                 group_key=group_key,
                 tracker=tracker,
                 group_supply=group_supply,
@@ -590,18 +539,6 @@ def allocate_for_cluster(
 
         hub_demand[hub]["rem_kg"] = rem_kg
         hub_demand[hub]["rem_m3"] = rem_m3
-
-    # ✅ Auditoria: se sobrou elétrico no plano, ele "deveria rodar no BRRC01", mas não teve como consumir
-    left_el = plan_pool[(plan_pool["avail"] > 0) & (plan_pool["Modal"].map(is_electric_modal))].copy()
-    if not left_el.empty:
-        sobraram = int(left_el["avail"].sum())
-        all_faltas.append({
-            "Grupo_Sinergia": group_key,
-            "Cluster": cluster_name,
-            "HUB": ELECTRIC_ALLOWED_HUB,
-            "Tipo": "ELETRICO_SOBROU_NO_PLANO",
-            "Faltou": sobraram,
-        })
 
     return records, plan_pool
 
