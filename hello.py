@@ -82,7 +82,19 @@ CAPACITY_ROWS = [
 # HELPERS
 # =========================
 def norm(s: str) -> str:
+    """Normaliza textos para comparações/matches.
+
+    - Uppercase
+    - Remove acentos/diacríticos (ex.: 'MÉDIO' -> 'MEDIO')
+    - Mantém apenas A-Z, 0-9 e espaços
+    """
     s = str(s).upper()
+    try:
+        import unicodedata
+        s = "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+    except Exception:
+        # fallback: segue sem remoção de acentos
+        pass
     s = re.sub(r"[^A-Z0-9]+", " ", s).strip()
     return s
 
