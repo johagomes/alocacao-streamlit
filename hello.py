@@ -19,6 +19,30 @@ FLEET_PRIORITY = {
     "SPOT DPC": 4,  # <- última prioridade
 }
 
+# =========================
+# SANITY HELPERS (auto-correção de colunas Modal x Tipo Frota)
+# =========================
+def _norm_str_series(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.upper().str.strip()
+
+def _fleet_match_pct(s: pd.Series) -> float:
+    fleet_set = set([k.upper() for k in FLEET_PRIORITY.keys()]) | {"KANGU"}
+    if s is None or len(s) == 0:
+        return 0.0
+    v = _norm_str_series(s)
+    return float(v.isin(fleet_set).mean())
+
+def _maybe_swap_modal_frota(plan_df: pd.DataFrame, col_modal: str, col_frota: str):
+    """Se detectar que col_modal parece 'Tipo Frota' (FF/SPOT/...) e col_frota parece 'Modal' (VUC/MÉDIO/...), troca."""
+    try:
+        pct_modal = _fleet_match_pct(plan_df[col_modal])
+        pct_frota = _fleet_match_pct(plan_df[col_frota])
+    except Exception:
+        return col_modal, col_frota
+    if pct_frota < 0.50 and pct_modal > 0.50 and (pct_modal - pct_frota) > 0.30:
+        return col_frota, col_modal
+    return col_modal, col_frota
+
 # ✅ AJUSTE: capacidades (kg) atualizadas para os modais solicitados (1800 kg)
 CAPACITY_ROWS = [
     ("Vuc", 16, 1600),
@@ -687,6 +711,9 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
     if missing_plan:
         raise ValueError(f"PlanoRotas: não encontrei as colunas necessárias: {', '.join(missing_plan)}")
 
+
+    # 🔎 Sanity check: se as colunas Modal e Tipo Frota estiverem invertidas (por header trocado ou detecção ambígua), corrige.
+    col_modal, col_frota = _maybe_swap_modal_frota(plan_df, col_modal, col_frota)
     # Detecta colunas IS
     col_cluster_i = find_col(is_df, ["CLUSTER", "Cluster"])
     col_hub = find_col(is_df, ["HUB", "Warehouse", "WH", "WAREHOUSE_ID"])
@@ -839,6 +866,19 @@ def run_allocation(plan_df: pd.DataFrame, is_df: pd.DataFrame, enable_synergy: b
     if not final_saldo.empty:
         final_saldo = final_saldo[final_saldo["Disponibilidade_Restante"] >= 1].copy()
 
+
+    # 🔎 Sanity check no output: se por algum motivo Modal/Tipo Frota estiverem invertidos, corrige antes de retornar.
+    if not final_output.empty:
+        pct_modal = _fleet_match_pct(final_output['Modal'])
+        pct_frota = _fleet_match_pct(final_output['Tipo Frota'])
+        if pct_modal > 0.60 and pct_frota < 0.40:
+            final_output = final_output.rename(columns={'Modal': '_tmp_modal', 'Tipo Frota': 'Modal'}).rename(columns={'_tmp_modal': 'Tipo Frota'})
+
+    if not final_saldo.empty:
+        pct_modal_s = _fleet_match_pct(final_saldo['Modal'])
+        pct_frota_s = _fleet_match_pct(final_saldo['Tipo Frota'])
+        if pct_modal_s > 0.60 and pct_frota_s < 0.40:
+            final_saldo = final_saldo.rename(columns={'Modal': '_tmp_modal', 'Tipo Frota': 'Modal'}).rename(columns={'_tmp_modal': 'Tipo Frota'})
     if return_debug:
         plan_common = plan[plan["Cluster"].astype(str).isin(common_clusters)].copy()
         # ✅ NOVO: retorna também isdata normalizado pra análises de demanda x capacidade x plano
@@ -1261,5 +1301,4 @@ if run:
         st.exception(e)
 else:
     st.info("Faça upload dos 2 arquivos na barra lateral e clique em **Rodar alocação**.")
-
 
